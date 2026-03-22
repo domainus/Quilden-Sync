@@ -3206,6 +3206,14 @@ class QuildenSyncSettingTab extends PluginSettingTab {
           : "Sign in with GitHub through Quilden. You choose exactly which repositories to share."
       )
       .addButton((btn) =>
+        btn.setButtonText("Use GitHub Token").onClick(() => {
+          const secretId = this.plugin.settings.githubSecretId;
+          new GitHubTokenPickerModal(this.app, secretId, async (selectedSecretId) => {
+            await this.handleGitHubSecretSelection(selectedSecretId, generation, statusEl);
+          }).open();
+        })
+      )
+      .addButton((btn) =>
         btn.setButtonText(this.plugin.settings.authMethod === "oauth" ? "Reconnect with GitHub" : "Connect with GitHub")
           .setCta()
           .onClick(async () => {
