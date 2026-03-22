@@ -204,6 +204,17 @@
   line-height: 1.5;
 }
 
+.lm-connect-card-standalone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.lm-connect-card-copy {
+  min-width: 0;
+}
+
 .lm-inline-branch-row {
   display: flex;
   align-items: center;

@@ -3313,6 +3313,104 @@ class QuildenSyncSettingTab extends PluginSettingTab {
     });
   }
 
+  private renderDisconnectedAuthCards(containerEl: HTMLElement, generation: number): void {
+    const oauthStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-status" });
+    const oauthErrorEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-error" });
+
+    const oauthCard = containerEl.createDiv({ cls: "lm-connect-card lm-connect-card-standalone" });
+    const oauthBody = oauthCard.createDiv({ cls: "lm-connect-card-copy" });
+    oauthBody.createDiv({ cls: "lm-connect-title", text: "GitHub account" });
+    oauthBody.createDiv({
+      cls: "lm-connect-subtitle",
+      text: "Sign in with GitHub through Quilden. You choose exactly which repositories to share.",
+    });
+    const oauthButton = oauthCard.createEl("button", {
+      text: "Connect with GitHub",
+      cls: "mod-cta",
+    });
+    oauthButton.addEventListener("click", async () => {
+      this.stopActivePolling();
+      let pollCount = 0;
+      const MAX_POLLS = 100;
+      oauthErrorEl.setText("");
+
+      const state = Array.from(crypto.getRandomValues(new Uint8Array(18)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      let githubOAuthUrl = `${QUILDEN_BASE}/api/auth/plugin-login?state=${state}`;
+      try {
+        const initRes = await requestUrl({
+          url: `${QUILDEN_BASE}/api/auth/plugin-login?state=${state}&json=1`,
+          method: "GET",
+          throw: false,
+        });
+        if (initRes.status === 200 && initRes.json?.url) {
+          githubOAuthUrl = initRes.json.url;
+        }
+      } catch {
+        // fall back to redirect flow
+      }
+
+      if (this.renderGeneration !== generation || !containerEl.isConnected) return;
+      const authWindow = window.open(githubOAuthUrl, "_blank");
+      if (!authWindow) {
+        oauthErrorEl.empty();
+        oauthErrorEl.appendText("Popup blocked. ");
+        const link = oauthErrorEl.createEl("a", { text: "Click here to sign in", href: githubOAuthUrl });
+        link.setAttr("target", "_blank");
+        link.setAttr("rel", "noopener noreferrer");
+      }
+
+      oauthButton.disabled = true;
+      oauthButton.textContent = "Waiting for GitHub…";
+      oauthStatusEl.setText("Complete sign-in in the browser window, then return here.");
+
+      this.activePollingTimer = window.setInterval(async () => {
+        pollCount++;
+        if (pollCount > MAX_POLLS) {
+          this.stopActivePolling();
+          oauthButton.disabled = false;
+          oauthButton.textContent = "Connect with GitHub";
+          oauthStatusEl.setText("");
+          oauthErrorEl.setText("Timed out. Please try again.");
+          return;
+        }
+
+        try {
+          const res = await requestUrl({
+            url: `${QUILDEN_BASE}/api/auth/plugin-token?state=${state}`,
+            method: "GET",
+          });
+          if (this.renderGeneration !== generation || !containerEl.isConnected) {
+            this.stopActivePolling();
+            return;
+          }
+
+          const data = res.json as { status: string; token?: string; login?: string };
+          if (data.status === "ok" && data.token && data.login) {
+            this.stopActivePolling();
+            this.allRepos = [];
+            await this.plugin.connectWithOAuthToken(data.token, data.login);
+            new Notice(`Quilden Sync: Connected as @${data.login} ✓`);
+            this.display();
+          } else if (data.status === "expired") {
+            this.stopActivePolling();
+            oauthButton.disabled = false;
+            oauthButton.textContent = "Connect with GitHub";
+            oauthStatusEl.setText("");
+            oauthErrorEl.setText("Session expired. Please try again.");
+          }
+        } catch {
+          // Network error — keep trying
+        }
+      }, 3000);
+    });
+
+    const tokenStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-token-status" });
+    this.renderGitHubTokenSetting(containerEl, generation, tokenStatusEl);
+  }
+
   private renderGitHubTokenSetting(
     containerEl: HTMLElement,
     generation: number,
@@ -3477,12 +3575,7 @@ class QuildenSyncSettingTab extends PluginSettingTab {
 
   // ── Not connected: OAuth flow via Quilden ────────────────
   private renderConnectSteps(containerEl: HTMLElement, generation: number) {
-    const oauthStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-status" });
-    const oauthErrorEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-error" });
-    this.renderGitHubAccountSetting(containerEl, generation, oauthStatusEl, oauthErrorEl, false);
-
-    const tokenStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-token-status" });
-    this.renderGitHubTokenSetting(containerEl, generation, tokenStatusEl);
+    this.renderDisconnectedAuthCards(containerEl, generation);
   }
 
   private renderRepositorySetting(containerEl: HTMLElement, generation: number) {
