@@ -1308,7 +1308,8 @@ export default class QuildenSyncPlugin extends Plugin {
       this.settings.repoOwner,
       this.settings.repoName,
       this.settings.branch,
-      this.settings.encryptionEnabled ? "enc" : "plain",
+      // Note: encryption state intentionally excluded — toggling encryption
+      // must NOT clear syncState or every file appears as a new candidate.
     ].join(":");
   }
 
@@ -2506,7 +2507,7 @@ class QuildenSyncSettingTab extends PluginSettingTab {
       encStatus.setText(`🔒 Encryption active — ${scopeLabel} are encrypted before upload`);
       } else if (this.plugin.settings.encryptionEnabled) {
         encStatus.addClass("inactive");
-        encStatus.setText("🔓 Encryption on — enter your password below to unlock");
+        encStatus.setText("🔒 Encryption enabled — enter your password below to activate");
       } else {
         encStatus.addClass("inactive");
         encStatus.setText("🔓 Encryption disabled — files are stored as plain text in GitHub");
@@ -2556,6 +2557,7 @@ class QuildenSyncSettingTab extends PluginSettingTab {
               .onChange(async (v) => {
                 this.plugin.settings.encryptionScope = v as "markdown" | "media" | "all";
                 await this.plugin.saveSettings();
+                this.display();
               })
           );
 
@@ -2564,17 +2566,27 @@ class QuildenSyncSettingTab extends PluginSettingTab {
 
         const hasSaved = this.plugin.hasSavedPassword;
         const showSavedState = !derivedKey && hasSaved && !this.changingPassword;
-        const showInputState = !derivedKey && (!hasSaved || this.changingPassword);
+        const showInputState = (!derivedKey && (!hasSaved || this.changingPassword)) || (!!derivedKey && this.changingPassword);
 
         const pwSetting = new Setting(pwGroup)
           .setName("Vault password")
           .setDesc(
-            derivedKey
-              ? "Encryption is unlocked for this session."
+            derivedKey && !this.changingPassword
+              ? "Encryption is active — files are encrypted on each sync."
               : showSavedState
                 ? "Password saved on this device — auto-applied on startup."
-                : "Enter your password to unlock encryption for this session."
+                : "Enter your password to activate encryption."
           );
+
+        if (derivedKey && !this.changingPassword) {
+          pwSetting.addButton((btn) =>
+            btn.setButtonText("Change password").onClick(() => {
+              this.changingPassword = true;
+              this.unlockFeedback = null;
+              this.display();
+            })
+          );
+        }
 
         if (showSavedState) {
           // Show filled-bullet placeholder + action buttons
@@ -2616,12 +2628,14 @@ class QuildenSyncSettingTab extends PluginSettingTab {
 
         if (showInputState) {
           const doUnlock = async (password: string) => {
+            // If changing password while already unlocked, clear first so tryUnlockEncryption re-derives
+            if (derivedKey) clearEncryptionKey();
             this.unlockFeedback = null;
             await this.plugin.tryUnlockEncryption(password);
             if (derivedKey) {
               this.plugin.savePassword(password);
               this.changingPassword = false;
-              this.unlockFeedback = { ok: true, msg: "✓ Password correct — saved on this device." };
+              this.unlockFeedback = { ok: true, msg: "✓ Password saved on this device." };
             } else {
               this.unlockFeedback = { ok: false, msg: "✗ Wrong password. Please try again." };
             }
