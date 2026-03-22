@@ -3295,6 +3295,22 @@ class QuildenSyncSettingTab extends PluginSettingTab {
             }, 3000);
           })
       );
+
+    const tokenShortcut = containerEl.createDiv({ cls: "lm-github-token-shortcut" });
+    tokenShortcut.createSpan({
+      cls: "lm-github-token-shortcut-copy",
+      text: "Prefer a personal access token stored in Obsidian Secrets?",
+    });
+    const tokenShortcutBtn = tokenShortcut.createEl("button", {
+      text: "Use GitHub Token",
+      cls: "lm-github-token-shortcut-btn",
+    });
+    tokenShortcutBtn.addEventListener("click", () => {
+      const secretId = this.plugin.settings.githubSecretId;
+      new GitHubTokenPickerModal(this.app, secretId, async (selectedSecretId) => {
+        await this.handleGitHubSecretSelection(selectedSecretId, generation, statusEl);
+      }).open();
+    });
   }
 
   private renderGitHubTokenSetting(
