@@ -324,6 +324,27 @@
   color: var(--text-error);
 }
 
+.lm-github-token-shortcut {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -4px 0 14px;
+  padding: 10px 14px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-secondary-alt, var(--background-secondary));
+}
+
+.lm-github-token-shortcut-copy {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.lm-github-token-shortcut-btn {
+  flex-shrink: 0;
+}
+
 .lm-github-token-modal .modal-content,
 .lm-github-token-modal {
   padding-bottom: 8px;
@@ -348,6 +369,11 @@
 
   .lm-github-token-card-controls {
     flex-wrap: wrap;
+  }
+
+  .lm-github-token-shortcut {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 
