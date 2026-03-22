@@ -129,8 +129,20 @@
   margin-bottom: 18px;
 }
 
-.lm-settings-title-row h2 {
+.lm-settings-title-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.lm-settings-title-heading h2 {
   margin: 0;
+}
+
+.lm-settings-version-badge {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-weight: 400;
 }
 
 .lm-settings-title-link {

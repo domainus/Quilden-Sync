@@ -2444,7 +2444,9 @@ class QuildenSyncSettingTab extends PluginSettingTab {
     containerEl.addClass("quilden-sync-settings");
 
     const titleRow = containerEl.createDiv({ cls: "lm-settings-title-row" });
-    titleRow.createEl("h2", { text: "Quilden Sync" });
+    const titleEl = titleRow.createDiv({ cls: "lm-settings-title-heading" });
+    titleEl.createEl("h2", { text: "Quilden Sync" });
+    titleEl.createEl("span", { text: `v${this.plugin.manifest.version}`, cls: "lm-settings-version-badge" });
     const websiteLink = titleRow.createEl("a", {
       text: "Open Quilden Website",
       href: QUILDEN_BASE,
