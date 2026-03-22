@@ -3296,16 +3296,18 @@ class QuildenSyncSettingTab extends PluginSettingTab {
   ) {
     const secretId = this.plugin.settings.githubSecretId;
     const tokenMissing = !!(secretId && !this.plugin.getGithubToken());
-    const tokenSetting = new Setting(containerEl)
-      .setName("GitHub Token")
-      .setDesc(
-        secretId
-          ? `Using secret "${secretId}" for GitHub API access.`
-          : "Select a secret as token for this repository (optional)"
-      )
-      .setClass("lm-github-token-setting");
+    const card = containerEl.createDiv({ cls: "lm-connect-card lm-github-token-card" });
+    const info = card.createDiv({ cls: "lm-github-token-copy" });
+    info.createDiv({ cls: "lm-connect-title", text: "GitHub Token" });
+    info.createDiv({
+      cls: "lm-connect-subtitle",
+      text: secretId
+        ? `Using secret "${secretId}" for GitHub API access.`
+        : "Select a secret as token for this repository (optional)",
+    });
 
-    const display = tokenSetting.controlEl.createDiv({ cls: "lm-github-token-display" });
+    const controls = card.createDiv({ cls: "lm-github-token-card-controls" });
+    const display = controls.createDiv({ cls: "lm-github-token-display" });
     display.createSpan({
       cls: "lm-github-token-mask",
       text: secretId ? "••••••••" : "No secret selected",
@@ -3315,21 +3317,23 @@ class QuildenSyncSettingTab extends PluginSettingTab {
       display.createSpan({ cls: "lm-github-token-id", text: secretId });
     }
 
-    tokenSetting.addButton((btn) =>
-      btn.setButtonText(secretId ? "Change" : "Select").onClick(() => {
-        new GitHubTokenPickerModal(this.app, secretId, async (selectedSecretId) => {
-          await this.handleGitHubSecretSelection(selectedSecretId, generation, statusEl);
-        }).open();
-      })
-    );
-
     if (secretId) {
-      tokenSetting.addExtraButton((btn) =>
-        btn.setIcon("x").setTooltip("Clear selected token").onClick(async () => {
-          await this.handleGitHubSecretSelection("", generation, statusEl);
-        })
-      );
+      const clearBtn = controls.createEl("button", { cls: "clickable-icon lm-github-token-clear", attr: { "aria-label": "Clear selected token" } });
+      setIcon(clearBtn, "x");
+      clearBtn.addEventListener("click", async () => {
+        await this.handleGitHubSecretSelection("", generation, statusEl);
+      });
     }
+
+    const changeBtn = controls.createEl("button", {
+      text: secretId ? "Change" : "Select",
+      cls: secretId ? "" : "mod-cta",
+    });
+    changeBtn.addEventListener("click", () => {
+      new GitHubTokenPickerModal(this.app, secretId, async (selectedSecretId) => {
+        await this.handleGitHubSecretSelection(selectedSecretId, generation, statusEl);
+      }).open();
+    });
 
     if (tokenMissing) {
       statusEl.setText("Configured GitHub secret is missing. Re-select your token.");
