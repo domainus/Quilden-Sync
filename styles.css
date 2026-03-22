@@ -245,6 +245,35 @@
   min-width: 140px;
 }
 
+.quilden-sync-settings .lm-github-token-setting .setting-item-control {
+  min-width: 320px;
+}
+
+.quilden-sync-settings .lm-github-token-control {
+  min-width: 320px;
+}
+
+.quilden-sync-settings .lm-github-token-control > * {
+  width: 100%;
+}
+
+.lm-github-auth-status,
+.lm-github-auth-error,
+.lm-github-token-status {
+  margin: -8px 0 10px;
+  font-size: 12px;
+}
+
+.lm-github-auth-status,
+.lm-github-token-status {
+  color: var(--text-muted);
+}
+
+.lm-github-auth-error,
+.lm-github-token-status--error {
+  color: var(--text-error);
+}
+
 /* Steps */
 .lm-step {
   border-left: 2px solid var(--interactive-accent);
