@@ -16,7 +16,7 @@ import {
 } from "obsidian";
 
 
-const QUILDEN_BASE = "https://quilden.com";
+const QUILDEN_BASE = "https://quilden.app";
 
 interface QuildenSyncSettings {
   githubToken: string;
