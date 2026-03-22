@@ -4,6 +4,8 @@
 
 ---
 
+> **IT IS HIGHLY RECOMMENDED TO BACKUP YOUR VAULT BEFORE USING THIS PLUGIN FOR THE FIRST TIME.**
+
 ## Features
 
 - **Automatic GitHub sync** — push and pull your vault on save, on a schedule, or manually
