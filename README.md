@@ -2,6 +2,8 @@
 
 **Quilden Sync** is a free Obsidian plugin that syncs your vault to a GitHub repository with optional zero-knowledge end-to-end encryption. Combined with [Quilden](https://quilden.com) — a web-based Obsidian-style editor — your notes become accessible from any device or network, without installing anything.
 
+Requires Obsidian `1.11.4` or newer.
+
 ---
 
 > **IT IS HIGHLY RECOMMENDED TO BACKUP YOUR VAULT BEFORE USING THIS PLUGIN FOR THE FIRST TIME.**
@@ -61,9 +63,14 @@
 
 Open **Settings → Quilden Sync** after enabling the plugin.
 
+Authenticate with either:
+
+1. **Connect with GitHub** to sign in through Quilden and store the returned token in Obsidian's built-in secrets vault.
+2. **GitHub Token** to select a personal access token from Obsidian's built-in secrets vault.
+
 | Setting | Description |
 |---------|-------------|
-| **GitHub Token** | A Personal Access Token with `repo` scope. Generate one from the plugin's settings page or from [GitHub → Settings → Developer settings → Tokens](https://github.com/settings/tokens). |
+| **GitHub Token** | Select a GitHub token from Obsidian's secrets vault. Fine-grained tokens work as long as they can read your account and write to the selected repository. |
 | **Repository owner** | Your GitHub username or organisation name |
 | **Repository name** | The repo to sync your vault into |
 | **Branch** | Branch to sync against (default: `main`) |
@@ -73,6 +80,8 @@ Open **Settings → Quilden Sync** after enabling the plugin.
 | **Conflict strategy** | `local` / `remote` / `newer` — how to resolve conflicts |
 | **Exclude patterns** | Glob patterns to skip (`.obsidian/`, `.trash/`, `.DS_Store` excluded by default) |
 | **Notification location** | `notice` (popup) / `statusbar` / `none` |
+
+If you do not already have a secret saved in Obsidian, click the token selector in plugin settings and use the built-in secret picker to add one.
 
 ---
 
@@ -152,7 +161,8 @@ Restores use GitHub's commit history, so no data is ever permanently lost.
 ## Troubleshooting
 
 **Sync fails with authentication error**
-- Regenerate your GitHub token and ensure it has `repo` scope
+- Re-select your GitHub secret in the plugin settings if the stored secret was removed or renamed
+- Regenerate your GitHub token and ensure it can write to the selected repository
 - Tokens from the plugin settings page have the correct scope automatically
 
 **Files not syncing**

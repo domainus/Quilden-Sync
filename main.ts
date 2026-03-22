@@ -7,6 +7,7 @@ import {
   Platform,
   Plugin,
   PluginSettingTab,
+  SecretComponent,
   Setting,
 
   requestUrl,
@@ -17,9 +18,13 @@ import {
 
 
 const QUILDEN_BASE = "https://quilden.com";
+const GITHUB_SECRET_PREFIX = "quilden-github-token";
+
+type GitHubAuthMethod = "oauth" | "token" | "";
 
 interface QuildenSyncSettings {
-  githubToken: string;
+  githubSecretId: string;
+  authMethod: GitHubAuthMethod;
   githubUsername: string;
   repoOwner: string;
   repoName: string;
@@ -59,6 +64,10 @@ interface PersistedPluginData {
   syncHistory?: SyncHistoryEntry[];
 }
 
+type LegacySettingsShape = Partial<QuildenSyncSettings> & {
+  githubToken?: string;
+};
+
 type IncrementalCandidateReason = "dirty-path" | "missing-sync-state" | "metadata-changed";
 
 interface IncrementalCandidateDiagnostic {
@@ -71,7 +80,8 @@ interface IncrementalCandidateDiagnostic {
 const MAX_SYNC_DIAGNOSTIC_SAMPLE = 20;
 
 const DEFAULT_SETTINGS: QuildenSyncSettings = {
-  githubToken: "",
+  githubSecretId: "",
+  authMethod: "",
   githubUsername: "",
   repoOwner: "",
   repoName: "",
@@ -340,6 +350,16 @@ const GH_HEADERS = {
 
 function ghHeaders(token: string, extra?: Record<string, string>): Record<string, string> {
   return { ...GH_HEADERS, Authorization: `Bearer ${token}`, ...extra };
+}
+
+function normalizeSecretIdPart(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return normalized || "default";
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -1230,6 +1250,149 @@ export default class QuildenSyncPlugin extends Plugin {
     files: {},
   };
 
+  buildGithubSecretId(loginOrLabel?: string): string {
+    if (!loginOrLabel) return GITHUB_SECRET_PREFIX;
+    return `${GITHUB_SECRET_PREFIX}-${normalizeSecretIdPart(loginOrLabel)}`;
+  }
+
+  getGithubToken(): string {
+    const secretId = this.settings.githubSecretId?.trim();
+    if (!secretId) return "";
+    return this.app.secretStorage.getSecret(secretId) ?? "";
+  }
+
+  setGithubSecret(secretId: string, token: string): void {
+    this.app.secretStorage.setSecret(secretId, token);
+    this.settings.githubSecretId = secretId;
+  }
+
+  clearGithubSecretReference(): void {
+    this.settings.githubSecretId = "";
+  }
+
+  private getGithubTokenError(): string {
+    return this.settings.githubSecretId
+      ? "Configured GitHub secret is missing. Re-select your token."
+      : "No GitHub token configured.";
+  }
+
+  private requireGithubToken(): string {
+    const token = this.getGithubToken();
+    if (!token) throw new Error(this.getGithubTokenError());
+    return token;
+  }
+
+  private async verifyGithubTokenIdentity(token: string): Promise<{ login: string; avatar_url?: string }> {
+    const tokenCheck = await requestUrl({
+      url: "https://api.github.com/user",
+      method: "GET",
+      headers: ghHeaders(token),
+      throw: false,
+    });
+
+    if (tokenCheck.status === 401) {
+      throw new Error("GitHub token is invalid or expired.");
+    }
+    if (tokenCheck.status >= 400) {
+      const message = tokenCheck.json?.message ?? tokenCheck.status;
+      throw new Error(`Unable to verify GitHub token (${tokenCheck.status}: ${message})`);
+    }
+
+    return tokenCheck.json as { login: string; avatar_url?: string };
+  }
+
+  private async verifyRepoPushAccess(
+    token: string,
+    owner = this.settings.repoOwner,
+    repo = this.settings.repoName
+  ): Promise<void> {
+    if (!owner || !repo) return;
+
+    const repoUrl = `https://api.github.com/repos/${owner}/${repo}`;
+    const repoCheck = await requestUrl({
+      url: repoUrl,
+      method: "GET",
+      headers: ghHeaders(token),
+      throw: false,
+    });
+
+    if (repoCheck.status === 404) {
+      throw new Error(
+        `GitHub token cannot access ${owner}/${repo}. Reconnect and grant that repository, or choose a different repo.`
+      );
+    }
+
+    if (repoCheck.status === 403) {
+      const resetEpoch = repoCheck.headers?.["x-ratelimit-reset"];
+      const resetTime = resetEpoch ? new Date(Number(resetEpoch) * 1000).toLocaleTimeString() : "unknown";
+      const message = repoCheck.json?.message ?? repoCheck.status;
+      if (repoCheck.headers?.["x-ratelimit-remaining"] === "0") {
+        throw new Error(`GitHub rate limit exceeded — resets at ${resetTime}. Wait and try again.`);
+      }
+      throw new Error(`GitHub denied access to ${owner}/${repo} (${message}).`);
+    }
+
+    if (repoCheck.status >= 400) {
+      const message = repoCheck.json?.message ?? repoCheck.status;
+      throw new Error(`Unable to verify repo access (${repoCheck.status}: ${message})`);
+    }
+
+    const permissions = repoCheck.json?.permissions as RepoPermissionSummary | undefined;
+    if (permissions && !permissions.admin && !permissions.maintain && !permissions.push) {
+      throw new Error(
+        `GitHub token can read ${owner}/${repo} but cannot push to it. Reconnect and grant write access.`
+      );
+    }
+  }
+
+  private async preserveOrResetRepoSelection(token: string): Promise<void> {
+    if (!this.settings.repoOwner || !this.settings.repoName) return;
+
+    try {
+      await this.verifyRepoPushAccess(token, this.settings.repoOwner, this.settings.repoName);
+    } catch (error) {
+      console.warn("[LM] clearing repo selection after auth change:", error);
+      this.settings.repoOwner = "";
+      this.settings.repoName = "";
+      this.settings.branch = "main";
+      new Notice("Selected auth cannot access the current repo. Please choose a repository again.", 6000);
+    }
+  }
+
+  async connectWithSecretId(secretId: string, authMethod: Exclude<GitHubAuthMethod, "">): Promise<string> {
+    const token = this.app.secretStorage.getSecret(secretId) ?? "";
+    if (!token) {
+      throw new Error("Selected secret is empty or missing. Choose a GitHub token secret.");
+    }
+
+    const identity = await this.verifyGithubTokenIdentity(token);
+    this.settings.githubSecretId = secretId;
+    this.settings.githubUsername = identity.login;
+    this.settings.authMethod = authMethod;
+    await this.preserveOrResetRepoSelection(token);
+    await this.saveSettings();
+    return identity.login;
+  }
+
+  async connectWithOAuthToken(token: string, login: string): Promise<void> {
+    const secretId = this.buildGithubSecretId(login);
+    this.setGithubSecret(secretId, token);
+    this.settings.githubUsername = login;
+    this.settings.authMethod = "oauth";
+    await this.preserveOrResetRepoSelection(token);
+    await this.saveSettings();
+  }
+
+  async disconnectGithub(): Promise<void> {
+    this.clearGithubSecretReference();
+    this.settings.githubUsername = "";
+    this.settings.repoOwner = "";
+    this.settings.repoName = "";
+    this.settings.branch = "main";
+    this.settings.authMethod = "";
+    await this.saveSettings();
+  }
+
   async onload() {
     await this.loadSettings();
 
@@ -1269,11 +1432,17 @@ export default class QuildenSyncPlugin extends Plugin {
           new Notice("Quilden Sync: Configure your repo first.");
           return;
         }
-        const api = new GitHubAPI(
-          this.settings.githubToken, this.settings.repoOwner,
-          this.settings.repoName, this.settings.branch
-        );
-        new BranchTimelineModal(this.app, api, this).open();
+        try {
+          const api = new GitHubAPI(
+            this.requireGithubToken(),
+            this.settings.repoOwner,
+            this.settings.repoName,
+            this.settings.branch
+          );
+          new BranchTimelineModal(this.app, api, this).open();
+        } catch (error) {
+          new Notice(`Quilden Sync: ${error instanceof Error ? error.message : "GitHub token unavailable."}`, 6000);
+        }
       },
     });
 
@@ -1510,10 +1679,13 @@ export default class QuildenSyncPlugin extends Plugin {
   }
 
   async loadSettings() {
-    const stored = (await this.loadData()) as PersistedPluginData | Partial<QuildenSyncSettings> | null;
+    const stored = (await this.loadData()) as PersistedPluginData | LegacySettingsShape | null;
+    let legacyGithubToken = "";
 
     if (stored && "settings" in stored) {
-      this.settings = Object.assign({}, DEFAULT_SETTINGS, stored.settings ?? {});
+      const storedSettings = (stored.settings ?? {}) as LegacySettingsShape;
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, storedSettings);
+      legacyGithubToken = typeof storedSettings.githubToken === "string" ? storedSettings.githubToken.trim() : "";
       // Migration: data.json syncState (may be stale if iCloud overwrote it).
       // Will be superseded by localStorage state after settings are applied.
       const rawSyncState = stored.syncState ?? { repoKey: "", files: {} };
@@ -1524,7 +1696,9 @@ export default class QuildenSyncPlugin extends Plugin {
       this.encryptionVerifyToken = stored.encryptionVerifyToken ?? null;
       this.syncHistory = stored.syncHistory ?? [];
     } else {
-      this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? {});
+      const storedSettings = (stored ?? {}) as LegacySettingsShape;
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, storedSettings);
+      legacyGithubToken = typeof storedSettings.githubToken === "string" ? storedSettings.githubToken.trim() : "";
       this.syncState = { repoKey: "", files: {} };
       this.encryptionVerifyToken = null;
     }
@@ -1533,6 +1707,20 @@ export default class QuildenSyncPlugin extends Plugin {
       ...this.settings,
       excludePatterns: this.normalizeExcludePatterns(this.settings.excludePatterns),
     };
+    delete (this.settings as QuildenSyncSettings & { githubToken?: string }).githubToken;
+
+    if (!this.settings.authMethod && this.settings.githubSecretId) {
+      this.settings.authMethod = this.settings.githubUsername ? "oauth" : "token";
+    }
+
+    let migratedLegacyToken = false;
+    if (legacyGithubToken && !this.settings.githubSecretId) {
+      const secretId = this.buildGithubSecretId(this.settings.githubUsername || "legacy");
+      this.setGithubSecret(secretId, legacyGithubToken);
+      this.settings.authMethod = this.settings.githubUsername ? "oauth" : "token";
+      migratedLegacyToken = true;
+      console.log(`[LM] migrated legacy github token into secret storage as ${secretId}`);
+    }
 
     // Prefer localStorage syncState (device-local, immune to iCloud overwrite).
     // localStorage key uses the repo coordinates from settings, which are now set.
@@ -1549,6 +1737,10 @@ export default class QuildenSyncPlugin extends Plugin {
 
     this.ensureSyncStateRepoKey();
     console.log(`[LM] loadSettings: final syncState key="${this.syncState.repoKey}" files=${Object.keys(this.syncState.files).length}`);
+
+    if (migratedLegacyToken) {
+      await this.savePluginData();
+    }
   }
 
   private async savePluginData() {
@@ -1573,7 +1765,7 @@ export default class QuildenSyncPlugin extends Plugin {
   }
 
   isConfigured(): boolean {
-    return !!(this.settings.githubToken && this.settings.repoOwner && this.settings.repoName);
+    return !!(this.getGithubToken() && this.settings.repoOwner && this.settings.repoName);
   }
 
   private setupAutoSync() {
@@ -1707,7 +1899,7 @@ export default class QuildenSyncPlugin extends Plugin {
     }
 
     const api = new GitHubAPI(
-      this.settings.githubToken,
+      this.requireGithubToken(),
       this.settings.repoOwner,
       this.settings.repoName,
       this.settings.branch
@@ -1775,7 +1967,7 @@ export default class QuildenSyncPlugin extends Plugin {
     }
 
     const api = new GitHubAPI(
-      this.settings.githubToken,
+      this.requireGithubToken(),
       this.settings.repoOwner,
       this.settings.repoName,
       this.settings.branch
@@ -1829,7 +2021,7 @@ export default class QuildenSyncPlugin extends Plugin {
 
   async tryUnlockEncryption(password: string): Promise<void> {
     if (!password) return;
-    const { githubUsername, repoOwner, repoName, branch, githubToken } = this.settings;
+    const { githubUsername, repoOwner, repoName, branch } = this.settings;
     if (!githubUsername || !repoOwner || !repoName) {
       new Notice("Connect GitHub and select a repo first.");
       return;
@@ -1851,7 +2043,7 @@ export default class QuildenSyncPlugin extends Plugin {
 
     // ── New device: no local token — verify via repo ─────────────────────────
     const VERIFY_PATH = ".quilden/encryption-verify";
-    const api = new GitHubAPI(githubToken, repoOwner, repoName, branch);
+    const api = new GitHubAPI(this.requireGithubToken(), repoOwner, repoName, branch);
     const salt = await contextSalt(githubUsername, repoOwner, repoName);
     const candidateKey = await buildKey(password, salt);
 
@@ -1937,7 +2129,8 @@ export default class QuildenSyncPlugin extends Plugin {
   }
 
   private openFileHistory(file: TFile) {
-    const { githubToken, repoOwner, repoName, branch, encryptionEnabled } = this.settings;
+    const { repoOwner, repoName, branch, encryptionEnabled } = this.settings;
+    const githubToken = this.getGithubToken();
     if (!githubToken || !repoOwner || !repoName) {
       new Notice("Quilden Sync: Configure your repo first.");
       return;
@@ -1948,12 +2141,13 @@ export default class QuildenSyncPlugin extends Plugin {
   }
 
   private async copyTokenForQuilden() {
-    if (!this.settings.githubToken) {
-      new Notice("Quilden Sync: No GitHub token configured.");
+    const token = this.getGithubToken();
+    if (!token) {
+      new Notice(`Quilden Sync: ${this.getGithubTokenError()}`, 6000);
       return;
     }
     try {
-      await navigator.clipboard.writeText(this.settings.githubToken);
+      await navigator.clipboard.writeText(token);
       new Notice("Token copied! Paste it into Quilden's sign-in form.");
     } catch {
       new Notice("Clipboard unavailable. Copy the token manually from settings.", 5000);
@@ -1961,8 +2155,9 @@ export default class QuildenSyncPlugin extends Plugin {
   }
 
   async openQuildenWebsite(statusEl?: HTMLElement): Promise<void> {
-    if (!this.settings.githubToken) {
-      new Notice("Quilden Sync: No GitHub token configured.");
+    const token = this.getGithubToken();
+    if (!token) {
+      new Notice(`Quilden Sync: ${this.getGithubTokenError()}`, 6000);
       return;
     }
     if (statusEl) { statusEl.setText("Connecting…"); statusEl.style.color = "var(--text-muted)"; }
@@ -1972,7 +2167,7 @@ export default class QuildenSyncPlugin extends Plugin {
         url: `${QUILDEN_BASE}/api/auth/from-pat`,
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: this.settings.githubToken }),
+        body: JSON.stringify({ token }),
         throw: false,
       });
 
@@ -1999,10 +2194,11 @@ export default class QuildenSyncPlugin extends Plugin {
   }
 
   private async verifySyncAccess(): Promise<void> {
+    const token = this.requireGithubToken();
     const tokenCheck = await requestUrl({
       url: "https://api.github.com/user",
       method: "GET",
-      headers: ghHeaders(this.settings.githubToken),
+      headers: ghHeaders(token),
       throw: false,
     });
 
@@ -2017,44 +2213,7 @@ export default class QuildenSyncPlugin extends Plugin {
 
     const scopes = tokenCheck.headers?.["x-oauth-scopes"] ?? "";
     console.log(`[LM] token scopes: "${scopes}"`);
-
-    const repoUrl = `https://api.github.com/repos/${this.settings.repoOwner}/${this.settings.repoName}`;
-    const repoCheck = await requestUrl({
-      url: repoUrl,
-      method: "GET",
-      headers: ghHeaders(this.settings.githubToken),
-      throw: false,
-    });
-
-    if (repoCheck.status === 404) {
-      throw new Error(
-        `GitHub token cannot access ${this.settings.repoOwner}/${this.settings.repoName}. ` +
-        "Reconnect and grant that repository, or choose a different repo."
-      );
-    }
-
-    if (repoCheck.status === 403) {
-      const resetEpoch = repoCheck.headers?.["x-ratelimit-reset"];
-      const resetTime = resetEpoch ? new Date(Number(resetEpoch) * 1000).toLocaleTimeString() : "unknown";
-      const message = repoCheck.json?.message ?? repoCheck.status;
-      if (repoCheck.headers?.["x-ratelimit-remaining"] === "0") {
-        throw new Error(`GitHub rate limit exceeded — resets at ${resetTime}. Wait and try again.`);
-      }
-      throw new Error(`GitHub denied access to ${this.settings.repoOwner}/${this.settings.repoName} (${message}).`);
-    }
-
-    if (repoCheck.status >= 400) {
-      const message = repoCheck.json?.message ?? repoCheck.status;
-      throw new Error(`Unable to verify repo access (${repoCheck.status}: ${message})`);
-    }
-
-    const permissions = repoCheck.json?.permissions as RepoPermissionSummary | undefined;
-    if (permissions && !permissions.admin && !permissions.maintain && !permissions.push) {
-      throw new Error(
-        `GitHub token can read ${this.settings.repoOwner}/${this.settings.repoName} but cannot push to it. ` +
-        "Reconnect and grant write access."
-      );
-    }
+    await this.verifyRepoPushAccess(token);
 
     if (!scopes) {
       console.log("[LM] token uses permission-based access; repo capability check passed");
@@ -2083,7 +2242,7 @@ export default class QuildenSyncPlugin extends Plugin {
       await this.verifySyncAccess();
 
       const api = new GitHubAPI(
-        this.settings.githubToken,
+        this.requireGithubToken(),
         this.settings.repoOwner,
         this.settings.repoName,
         this.settings.branch
@@ -2940,9 +3099,13 @@ class QuildenSyncSettingTab extends PluginSettingTab {
           .setDesc("View all commits on this branch and restore the repo to any past state. A new commit is created — no history is lost.")
           .addButton((btn) =>
             btn.setButtonText("Open timeline").onClick(() => {
-              const { githubToken, repoOwner, repoName, branch } = this.plugin.settings;
-              const api = new GitHubAPI(githubToken, repoOwner, repoName, branch);
-              new BranchTimelineModal(this.plugin.app, api, this.plugin).open();
+              try {
+                const { repoOwner, repoName, branch } = this.plugin.settings;
+                const api = new GitHubAPI(this.plugin.getGithubToken(), repoOwner, repoName, branch);
+                new BranchTimelineModal(this.plugin.app, api, this.plugin).open();
+              } catch (error) {
+                new Notice(`Quilden Sync: ${error instanceof Error ? error.message : "GitHub token unavailable."}`, 6000);
+              }
             })
           );
       }
@@ -2954,7 +3117,7 @@ class QuildenSyncSettingTab extends PluginSettingTab {
   // ─────────────────────────────────────────────────────────────
   private renderConnectionWizard(containerEl: HTMLElement, generation: number) {
     containerEl.createEl("h3", { text: "GitHub Connection", cls: "lm-settings-section-title" });
-    const isConnected = !!(this.plugin.settings.githubToken && this.plugin.settings.githubUsername);
+    const isConnected = !!this.plugin.settings.githubUsername;
     if (isConnected) {
       this.renderConnectedState(containerEl, generation);
     } else {
@@ -2962,30 +3125,195 @@ class QuildenSyncSettingTab extends PluginSettingTab {
     }
   }
 
+  private getAuthDescription(): string {
+    if (this.plugin.settings.authMethod === "oauth") return "Connected to GitHub via Quilden ✓";
+    if (this.plugin.settings.authMethod === "token") return "Connected to GitHub via token ✓";
+    return "Connected to GitHub ✓";
+  }
+
+  private renderGitHubAccountSetting(
+    containerEl: HTMLElement,
+    generation: number,
+    statusEl: HTMLElement,
+    errorEl: HTMLElement,
+    connected: boolean
+  ) {
+    let pollCount = 0;
+    const MAX_POLLS = 100;
+
+    new Setting(containerEl)
+      .setName("GitHub account")
+      .setDesc(
+        connected
+          ? "Reconnect with GitHub through Quilden, or switch back from a manual token."
+          : "Sign in with GitHub through Quilden. You choose exactly which repositories to share."
+      )
+      .addButton((btn) =>
+        btn.setButtonText(this.plugin.settings.authMethod === "oauth" ? "Reconnect with GitHub" : "Connect with GitHub")
+          .setCta()
+          .onClick(async () => {
+            this.stopActivePolling();
+            pollCount = 0;
+            errorEl.setText("");
+
+            const state = Array.from(crypto.getRandomValues(new Uint8Array(18)))
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join("");
+
+            let githubOAuthUrl = `${QUILDEN_BASE}/api/auth/plugin-login?state=${state}`;
+            try {
+              const initRes = await requestUrl({
+                url: `${QUILDEN_BASE}/api/auth/plugin-login?state=${state}&json=1`,
+                method: "GET",
+                throw: false,
+              });
+              if (initRes.status === 200 && initRes.json?.url) {
+                githubOAuthUrl = initRes.json.url;
+              }
+            } catch {
+              // fall back to redirect flow
+            }
+
+            if (this.renderGeneration !== generation || !containerEl.isConnected || !btn.buttonEl.isConnected) return;
+            console.log("[LM] opening OAuth URL:", githubOAuthUrl);
+            const authWindow = window.open(githubOAuthUrl, "_blank");
+            if (!authWindow) {
+              errorEl.empty();
+              errorEl.appendText("Popup blocked. ");
+              const link = errorEl.createEl("a", { text: "Click here to sign in", href: githubOAuthUrl });
+              link.setAttr("target", "_blank");
+              link.setAttr("rel", "noopener noreferrer");
+            }
+
+            btn.setDisabled(true);
+            btn.setButtonText("Waiting for GitHub…");
+            statusEl.setText("Complete sign-in in the browser window, then return here.");
+
+            this.activePollingTimer = window.setInterval(async () => {
+              pollCount++;
+              if (pollCount > MAX_POLLS) {
+                this.stopActivePolling();
+                btn.setDisabled(false);
+                btn.setButtonText("Connect with GitHub");
+                statusEl.setText("");
+                errorEl.setText("Timed out. Please try again.");
+                return;
+              }
+
+              try {
+                const res = await requestUrl({
+                  url: `${QUILDEN_BASE}/api/auth/plugin-token?state=${state}`,
+                  method: "GET",
+                });
+                if (this.renderGeneration !== generation || !containerEl.isConnected) {
+                  this.stopActivePolling();
+                  return;
+                }
+
+                const data = res.json as { status: string; token?: string; login?: string };
+                if (data.status === "ok" && data.token && data.login) {
+                  this.stopActivePolling();
+                  this.allRepos = [];
+                  await this.plugin.connectWithOAuthToken(data.token, data.login);
+                  new Notice(`Quilden Sync: Connected as @${data.login} ✓`);
+                  this.display();
+                } else if (data.status === "expired") {
+                  this.stopActivePolling();
+                  btn.setDisabled(false);
+                  btn.setButtonText("Connect with GitHub");
+                  statusEl.setText("");
+                  errorEl.setText("Session expired. Please try again.");
+                }
+              } catch {
+                // Network error — keep trying
+              }
+            }, 3000);
+          })
+      );
+  }
+
+  private renderGitHubTokenSetting(
+    containerEl: HTMLElement,
+    generation: number,
+    statusEl: HTMLElement
+  ) {
+    const secretId = this.plugin.settings.githubSecretId;
+    const tokenMissing = !!(secretId && !this.plugin.getGithubToken());
+
+    new Setting(containerEl)
+      .setName("GitHub Token")
+      .setDesc(
+        secretId
+          ? `Using secret "${secretId}" for GitHub API access.`
+          : "Select a secret as token for this repository (optional)"
+      )
+      .setClass("lm-github-token-setting")
+      .addComponent((el) => {
+        el.addClass("lm-github-token-control");
+        const secretComponent = new SecretComponent(this.app, el);
+        if (secretId) {
+          secretComponent.setValue(secretId);
+        }
+        secretComponent.onChange((value) => {
+          void this.handleGitHubSecretSelection(value, generation, statusEl);
+        });
+        return secretComponent;
+      });
+
+    if (tokenMissing) {
+      statusEl.setText("Configured GitHub secret is missing. Re-select your token.");
+      statusEl.addClass("lm-github-token-status--error");
+    }
+  }
+
+  private async handleGitHubSecretSelection(value: string, generation: number, statusEl: HTMLElement): Promise<void> {
+    if (this.renderGeneration !== generation) return;
+
+    const secretId = value.trim();
+    statusEl.removeClass("lm-github-token-status--error");
+
+    if (!secretId) {
+      this.allRepos = [];
+      await this.plugin.disconnectGithub();
+      statusEl.setText("GitHub token cleared.");
+      this.display();
+      return;
+    }
+
+    statusEl.setText("Validating token…");
+    try {
+      this.allRepos = [];
+      const login = await this.plugin.connectWithSecretId(secretId, "token");
+      statusEl.setText(`Connected as @${login}.`);
+      new Notice(`Quilden Sync: Connected as @${login} ✓`);
+      this.display();
+    } catch (error) {
+      statusEl.setText(error instanceof Error ? error.message : "Failed to validate secret.");
+      statusEl.addClass("lm-github-token-status--error");
+    }
+  }
+
   // ── Connected state ──────────────────────────────────────────
   private renderConnectedState(containerEl: HTMLElement, generation: number) {
     const { settings } = this.plugin;
-    const activeBranch = settings.branch || "main";
-    const currentRepo = settings.repoOwner ? `${settings.repoOwner}/${settings.repoName}` : "";
-
-    // ── Username + Disconnect ──
     new Setting(containerEl)
       .setName(`@${settings.githubUsername}`)
-      .setDesc("Connected to GitHub ✓")
+      .setDesc(this.getAuthDescription())
       .addButton((btn) =>
         btn.setButtonText("Disconnect").onClick(async () => {
-          this.plugin.settings.githubToken = "";
-          this.plugin.settings.githubUsername = "";
-          this.plugin.settings.repoOwner = "";
-          this.plugin.settings.repoName = "";
-          this.plugin.settings.branch = "main";
           this.allRepos = [];
-          await this.plugin.saveSettings();
+          await this.plugin.disconnectGithub();
           this.display();
         })
       );
 
-    // ── Quilden website access ──
+    const oauthStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-status" });
+    const oauthErrorEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-error" });
+    this.renderGitHubAccountSetting(containerEl, generation, oauthStatusEl, oauthErrorEl, true);
+
+    const tokenStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-token-status" });
+    this.renderGitHubTokenSetting(containerEl, generation, tokenStatusEl);
+
     const quildenStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-quilden-status" });
     new Setting(containerEl)
       .setName("Use on Quilden website")
@@ -2997,12 +3325,13 @@ class QuildenSyncSettingTab extends PluginSettingTab {
       )
       .addButton((btn) =>
         btn.setButtonText("Copy token").onClick(async () => {
-          if (!this.plugin.settings.githubToken) {
-            new Notice("No token configured.");
-            return;
-          }
           try {
-            await navigator.clipboard.writeText(this.plugin.settings.githubToken);
+            const token = this.plugin.getGithubToken();
+            if (!token) {
+              new Notice("Configured GitHub secret is missing. Re-select your token.", 6000);
+              return;
+            }
+            await navigator.clipboard.writeText(token);
             btn.setButtonText("Copied!");
             new Notice(
               "⚠️ Keep this token secret! Anyone with it can access your connected GitHub repositories.",
@@ -3015,7 +3344,54 @@ class QuildenSyncSettingTab extends PluginSettingTab {
         })
       );
 
-    // ── Repository ──
+    this.renderRepositorySetting(containerEl, generation);
+  }
+
+  private async loadBranchSection(
+    sel: HTMLSelectElement,
+    token: string,
+    owner: string,
+    repo: string,
+    currentBranch: string
+  ) {
+    sel.empty();
+    sel.createEl("option", { text: "Loading…" });
+
+    try {
+      const branches = await GitHubAPI.fetchBranches(token, owner, repo);
+      sel.empty();
+      branches.forEach((b) => {
+        const opt = sel.createEl("option", { text: b });
+        opt.value = b;
+        if (b === currentBranch) opt.selected = true;
+      });
+    } catch {
+      sel.empty();
+      sel.createEl("option", { text: "Failed to load" });
+    }
+
+    sel.addEventListener("change", async () => {
+      this.plugin.settings.branch = sel.value;
+      await this.plugin.saveSettings();
+    });
+  }
+
+  // ── Not connected: OAuth flow via Quilden ────────────────
+  private renderConnectSteps(containerEl: HTMLElement, generation: number) {
+    const oauthStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-status" });
+    const oauthErrorEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-auth-error" });
+    this.renderGitHubAccountSetting(containerEl, generation, oauthStatusEl, oauthErrorEl, false);
+
+    const tokenStatusEl = containerEl.createEl("div", { cls: "setting-item-description lm-github-token-status" });
+    this.renderGitHubTokenSetting(containerEl, generation, tokenStatusEl);
+  }
+
+  private renderRepositorySetting(containerEl: HTMLElement, generation: number) {
+    const { settings } = this.plugin;
+    const activeBranch = settings.branch || "main";
+    const currentRepo = settings.repoOwner ? `${settings.repoOwner}/${settings.repoName}` : "";
+    const token = this.plugin.getGithubToken();
+
     if (currentRepo) {
       const repoSetting = new Setting(containerEl)
         .setName("Repository")
@@ -3054,7 +3430,8 @@ class QuildenSyncSettingTab extends PluginSettingTab {
         changeBranchButton.disabled = true;
 
         try {
-          const branches = await GitHubAPI.fetchBranches(settings.githubToken, settings.repoOwner, settings.repoName);
+          if (!token) throw new Error("Fix GitHub authentication above to load branches.");
+          const branches = await GitHubAPI.fetchBranches(token, settings.repoOwner, settings.repoName);
           if (this.renderGeneration !== generation || !branchDropdown.selectEl.isConnected) return;
 
           const nextValue = branches.includes(this.plugin.settings.branch || "main")
@@ -3093,223 +3470,99 @@ class QuildenSyncSettingTab extends PluginSettingTab {
           void loadBranches();
         }
       });
-    } else {
-      let selectedRepo = "";
-      let repoDropdown: DropdownComponent | null = null;
-      let selectRepoButton: ButtonComponent | null = null;
-      let loadingRepos = false;
+      return;
+    }
 
-      const repoPickerSetting = new Setting(containerEl)
-        .setName("Repository")
-        .setDesc("Loading repositories…")
-        .addDropdown((dropdown) => {
-          repoDropdown = dropdown;
-          dropdown.addOption("", "Loading repositories…");
-          dropdown.setValue("");
-          dropdown.onChange((value) => {
-            selectedRepo = value;
-            selectRepoButton?.setDisabled(!selectedRepo);
-          });
-        })
-        .addButton((btn) => {
-          selectRepoButton = btn;
-          btn.setButtonText("Use repo").setDisabled(true).onClick(async () => {
-            if (!selectedRepo) return;
-            const [owner, repo] = selectedRepo.split("/");
-            this.plugin.settings.repoOwner = owner;
-            this.plugin.settings.repoName = repo;
-            this.plugin.settings.branch = "main";
-            await this.plugin.saveSettings();
-            this.display();
-          });
-        })
-        .addButton((btn) =>
-          btn.setButtonText("Manage on GitHub").onClick(() => {
-            window.open(`${QUILDEN_BASE}/api/auth/manage-repos`, "_blank");
-          })
-        );
+    let selectedRepo = "";
+    let repoDropdown: DropdownComponent | null = null;
+    let selectRepoButton: ButtonComponent | null = null;
+    let loadingRepos = false;
 
-      const populateDropdown = () => {
-        if (!repoDropdown) return;
-        repoDropdown.selectEl.empty();
-        if (this.allRepos.length === 0) {
-          repoDropdown.addOption("", "No repositories found");
-          repoDropdown.setValue("");
-          selectedRepo = "";
-          selectRepoButton?.setDisabled(true);
-          repoPickerSetting.setDesc('No repositories found. Use "Manage on GitHub" to grant access.');
-          return;
-        }
-        repoDropdown.addOption("", "Select a repository");
-        this.allRepos.slice(0, 100).forEach((repo) => {
-          repoDropdown?.addOption(repo.full_name, repo.full_name);
+    const repoPickerSetting = new Setting(containerEl)
+      .setName("Repository")
+      .setDesc(token ? "Loading repositories…" : "Fix GitHub authentication above to load repositories.")
+      .addDropdown((dropdown) => {
+        repoDropdown = dropdown;
+        dropdown.addOption("", token ? "Loading repositories…" : "Connect GitHub first");
+        dropdown.setValue("");
+        dropdown.setDisabled(!token);
+        dropdown.onChange((value) => {
+          selectedRepo = value;
+          selectRepoButton?.setDisabled(!selectedRepo);
         });
-        const extraCount = Math.max(this.allRepos.length - 100, 0);
-        repoPickerSetting.setDesc(
-          extraCount > 0
-            ? `Showing 100 of ${this.allRepos.length} repositories.`
-            : `${this.allRepos.length} repositor${this.allRepos.length === 1 ? "y" : "ies"} available.`
-        );
-        const preserved = this.allRepos.some((r) => r.full_name === selectedRepo) ? selectedRepo : "";
-        selectedRepo = preserved;
-        repoDropdown.setValue(preserved);
-        selectRepoButton?.setDisabled(!preserved);
-      };
-
-      const loadRepos = async () => {
-        if (loadingRepos) return;
-        if (this.allRepos.length > 0) { populateDropdown(); return; }
-        loadingRepos = true;
-        try {
-          this.allRepos = await GitHubAPI.fetchRepos(settings.githubToken);
-          if (this.renderGeneration !== generation || !containerEl.isConnected) return;
-          populateDropdown();
-        } catch (error) {
-          if (this.renderGeneration !== generation || !containerEl.isConnected) return;
-          const message = error instanceof Error ? error.message : "unknown error";
-          repoPickerSetting.setDesc(`Failed to load repositories: ${message}`);
-          repoDropdown?.selectEl.empty();
-          repoDropdown?.addOption("", "Failed to load");
-          repoDropdown?.setValue("");
-          selectedRepo = "";
-          selectRepoButton?.setDisabled(true);
-        } finally {
-          loadingRepos = false;
-        }
-      };
-
-      void loadRepos();
-    }
-  }
-
-  private async loadBranchSection(
-    sel: HTMLSelectElement,
-    token: string,
-    owner: string,
-    repo: string,
-    currentBranch: string
-  ) {
-    sel.empty();
-    sel.createEl("option", { text: "Loading…" });
-
-    try {
-      const branches = await GitHubAPI.fetchBranches(token, owner, repo);
-      sel.empty();
-      branches.forEach((b) => {
-        const opt = sel.createEl("option", { text: b });
-        opt.value = b;
-        if (b === currentBranch) opt.selected = true;
-      });
-    } catch {
-      sel.empty();
-      sel.createEl("option", { text: "Failed to load" });
-    }
-
-    sel.addEventListener("change", async () => {
-      this.plugin.settings.branch = sel.value;
-      await this.plugin.saveSettings();
-    });
-  }
-
-  // ── Not connected: OAuth flow via Quilden ────────────────
-  private renderConnectSteps(containerEl: HTMLElement, generation: number) {
-    const statusEl = containerEl.createEl("div", { cls: "setting-item-description" });
-    const errorEl = containerEl.createEl("div", { cls: "setting-item-description" });
-
-    let pollCount = 0;
-    const MAX_POLLS = 100; // ~5 minutes at 3 s intervals
-
-    const stopPolling = () => {
-      this.stopActivePolling();
-    };
-
-    new Setting(containerEl)
-      .setName("GitHub account")
-      .setDesc("Sign in with GitHub through Quilden. You choose exactly which repositories to share.")
+      })
+      .addButton((btn) => {
+        selectRepoButton = btn;
+        btn.setButtonText("Use repo").setDisabled(true).onClick(async () => {
+          if (!selectedRepo) return;
+          const [owner, repo] = selectedRepo.split("/");
+          this.plugin.settings.repoOwner = owner;
+          this.plugin.settings.repoName = repo;
+          this.plugin.settings.branch = "main";
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      })
       .addButton((btn) =>
-        btn.setButtonText("Connect with GitHub").setCta().onClick(async () => {
-          stopPolling();
-          pollCount = 0;
-          errorEl.setText("");
-
-          const state = Array.from(crypto.getRandomValues(new Uint8Array(18)))
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join("");
-
-          let githubOAuthUrl = `${QUILDEN_BASE}/api/auth/plugin-login?state=${state}`;
-          try {
-            const initRes = await requestUrl({
-              url: `${QUILDEN_BASE}/api/auth/plugin-login?state=${state}&json=1`,
-              method: "GET",
-              throw: false,
-            });
-            if (initRes.status === 200 && initRes.json?.url) {
-              githubOAuthUrl = initRes.json.url;
-            }
-          } catch {
-            // fall back to redirect flow
-          }
-          if (this.renderGeneration !== generation || !containerEl.isConnected || !btn.buttonEl.isConnected) return;
-          console.log("[LM] opening OAuth URL:", githubOAuthUrl);
-          const authWindow = window.open(githubOAuthUrl, "_blank");
-          if (!authWindow) {
-            // Popup blocked — show a clickable link and still start polling
-            errorEl.empty();
-            errorEl.appendText("Popup blocked. ");
-            const link = errorEl.createEl("a", {
-              text: "Click here to sign in",
-              href: githubOAuthUrl,
-            });
-            link.setAttr("target", "_blank");
-            link.setAttr("rel", "noopener noreferrer");
-          }
-
-          btn.setDisabled(true);
-          btn.setButtonText("Waiting for GitHub…");
-          statusEl.setText("Complete sign-in in the browser window, then return here.");
-
-          this.activePollingTimer = window.setInterval(async () => {
-            pollCount++;
-            if (pollCount > MAX_POLLS) {
-              stopPolling();
-              btn.setDisabled(false);
-              btn.setButtonText("Connect with GitHub");
-              statusEl.setText("");
-              errorEl.setText("Timed out. Please try again.");
-              return;
-            }
-
-            try {
-              const res = await requestUrl({
-                url: `${QUILDEN_BASE}/api/auth/plugin-token?state=${state}`,
-                method: "GET",
-              });
-              if (this.renderGeneration !== generation || !containerEl.isConnected) {
-                stopPolling();
-                return;
-              }
-              const data = res.json as { status: string; token?: string; login?: string };
-
-              if (data.status === "ok" && data.token && data.login) {
-                stopPolling();
-                this.plugin.settings.githubToken = data.token;
-                this.plugin.settings.githubUsername = data.login;
-                await this.plugin.saveSettings();
-                new Notice(`Quilden Sync: Connected as @${data.login} ✓`);
-                this.display();
-              } else if (data.status === "expired") {
-                stopPolling();
-                btn.setDisabled(false);
-                btn.setButtonText("Connect with GitHub");
-                statusEl.setText("");
-                errorEl.setText("Session expired. Please try again.");
-              }
-            } catch {
-              // Network error — keep trying
-            }
-          }, 3000);
+        btn.setButtonText("Manage on GitHub").onClick(() => {
+          window.open(`${QUILDEN_BASE}/api/auth/manage-repos`, "_blank");
         })
       );
 
+    const populateDropdown = () => {
+      if (!repoDropdown) return;
+      repoDropdown.selectEl.empty();
+      if (this.allRepos.length === 0) {
+        repoDropdown.addOption("", "No repositories found");
+        repoDropdown.setValue("");
+        selectedRepo = "";
+        selectRepoButton?.setDisabled(true);
+        repoPickerSetting.setDesc('No repositories found. Use "Manage on GitHub" to grant access.');
+        return;
+      }
+
+      repoDropdown.addOption("", "Select a repository");
+      this.allRepos.slice(0, 100).forEach((repo) => {
+        repoDropdown?.addOption(repo.full_name, repo.full_name);
+      });
+      const extraCount = Math.max(this.allRepos.length - 100, 0);
+      repoPickerSetting.setDesc(
+        extraCount > 0
+          ? `Showing 100 of ${this.allRepos.length} repositories.`
+          : `${this.allRepos.length} repositor${this.allRepos.length === 1 ? "y" : "ies"} available.`
+      );
+      const preserved = this.allRepos.some((r) => r.full_name === selectedRepo) ? selectedRepo : "";
+      selectedRepo = preserved;
+      repoDropdown.setValue(preserved);
+      selectRepoButton?.setDisabled(!preserved);
+    };
+
+    const loadRepos = async () => {
+      if (!token || !repoDropdown || !selectRepoButton) return;
+      if (loadingRepos) return;
+      if (this.allRepos.length > 0) {
+        populateDropdown();
+        return;
+      }
+      loadingRepos = true;
+      try {
+        this.allRepos = await GitHubAPI.fetchRepos(token);
+        if (this.renderGeneration !== generation || !containerEl.isConnected) return;
+        populateDropdown();
+      } catch (error) {
+        if (this.renderGeneration !== generation || !containerEl.isConnected) return;
+        const message = error instanceof Error ? error.message : "unknown error";
+        repoPickerSetting.setDesc(`Failed to load repositories: ${message}`);
+        repoDropdown.selectEl.empty();
+        repoDropdown.addOption("", "Failed to load");
+        repoDropdown.setValue("");
+        selectedRepo = "";
+        selectRepoButton.setDisabled(true);
+      } finally {
+        loadingRepos = false;
+      }
+    };
+
+    void loadRepos();
   }
 }
