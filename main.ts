@@ -2654,6 +2654,63 @@ function confirmDialog(app: App, title: string, message: string): Promise<boolea
   });
 }
 
+class GitHubTokenPickerModal extends Modal {
+  private readonly initialSecretId: string;
+  private readonly onSave: (secretId: string) => Promise<void>;
+  private selectedSecretId: string;
+
+  constructor(app: App, initialSecretId: string, onSave: (secretId: string) => Promise<void>) {
+    super(app);
+    this.initialSecretId = initialSecretId;
+    this.selectedSecretId = initialSecretId;
+    this.onSave = onSave;
+  }
+
+  onOpen(): void {
+    const { contentEl, modalEl } = this;
+    contentEl.empty();
+    contentEl.addClass("lm-github-token-modal");
+    modalEl.style.width = "min(92vw, 760px)";
+
+    contentEl.createEl("h2", { text: "Select secret" });
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "Choose the Obsidian secret that contains your GitHub token.",
+    });
+
+    const pickerHost = contentEl.createDiv({ cls: "lm-github-token-modal-picker" });
+    const secretComponent = new SecretComponent(this.app, pickerHost);
+    if (this.initialSecretId) {
+      secretComponent.setValue(this.initialSecretId);
+    }
+    secretComponent.onChange((value) => {
+      this.selectedSecretId = value.trim();
+    });
+
+    const footer = contentEl.createDiv({ cls: "lm-github-token-modal-footer" });
+    const cancelBtn = footer.createEl("button", { text: "Cancel" });
+    const saveBtn = footer.createEl("button", { text: "Save", cls: "mod-cta" });
+
+    cancelBtn.addEventListener("click", () => this.close());
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      cancelBtn.disabled = true;
+      try {
+        await this.onSave(this.selectedSecretId);
+        this.close();
+      } catch (error) {
+        saveBtn.disabled = false;
+        cancelBtn.disabled = false;
+        new Notice(error instanceof Error ? error.message : "Failed to save GitHub token secret.", 6000);
+      }
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 class QuildenSyncSettingTab extends PluginSettingTab {
   plugin: QuildenSyncPlugin;
   private showAdvanced = false;
@@ -3239,26 +3296,40 @@ class QuildenSyncSettingTab extends PluginSettingTab {
   ) {
     const secretId = this.plugin.settings.githubSecretId;
     const tokenMissing = !!(secretId && !this.plugin.getGithubToken());
-
-    new Setting(containerEl)
+    const tokenSetting = new Setting(containerEl)
       .setName("GitHub Token")
       .setDesc(
         secretId
           ? `Using secret "${secretId}" for GitHub API access.`
           : "Select a secret as token for this repository (optional)"
       )
-      .setClass("lm-github-token-setting")
-      .addComponent((el) => {
-        el.addClass("lm-github-token-control");
-        const secretComponent = new SecretComponent(this.app, el);
-        if (secretId) {
-          secretComponent.setValue(secretId);
-        }
-        secretComponent.onChange((value) => {
-          void this.handleGitHubSecretSelection(value, generation, statusEl);
-        });
-        return secretComponent;
-      });
+      .setClass("lm-github-token-setting");
+
+    const display = tokenSetting.controlEl.createDiv({ cls: "lm-github-token-display" });
+    display.createSpan({
+      cls: "lm-github-token-mask",
+      text: secretId ? "••••••••" : "No secret selected",
+    });
+
+    if (secretId) {
+      display.createSpan({ cls: "lm-github-token-id", text: secretId });
+    }
+
+    tokenSetting.addButton((btn) =>
+      btn.setButtonText(secretId ? "Change" : "Select").onClick(() => {
+        new GitHubTokenPickerModal(this.app, secretId, async (selectedSecretId) => {
+          await this.handleGitHubSecretSelection(selectedSecretId, generation, statusEl);
+        }).open();
+      })
+    );
+
+    if (secretId) {
+      tokenSetting.addExtraButton((btn) =>
+        btn.setIcon("x").setTooltip("Clear selected token").onClick(async () => {
+          await this.handleGitHubSecretSelection("", generation, statusEl);
+        })
+      );
+    }
 
     if (tokenMissing) {
       statusEl.setText("Configured GitHub secret is missing. Re-select your token.");
