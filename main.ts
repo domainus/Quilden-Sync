@@ -485,12 +485,15 @@ class GitHubAPI {
     return (res.json as Array<{ name: string }>).map((b) => b.name);
   }
 
-  async getTree(): Promise<Array<{ path: string; sha: string; type: string }>> {
+  async getTree(): Promise<{ blobs: Array<{ path: string; sha: string; type: string }>; truncated: boolean }> {
     const data = await this.request(
       "GET",
       `/repos/${this.owner}/${this.repo}/git/trees/${encodeURIComponent(this.branch)}?recursive=true`
     );
-    return (data.tree || []).filter((item: any) => item.type === "blob");
+    return {
+      blobs: (data.tree || []).filter((item: any) => item.type === "blob"),
+      truncated: !!data.truncated,
+    };
   }
 
   async getFileContent(path: string): Promise<{ content: string; sha: string }> {
@@ -1698,7 +1701,7 @@ export default class QuildenSyncPlugin extends Plugin {
     );
 
     new Notice("Scanning repo for unencrypted files…");
-    const tree = await api.getTree();
+    const { blobs: tree } = await api.getTree();
     const filesToCheck = tree.filter((f) => shouldEncryptPath(f.path, this.settings.encryptionScope));
 
     const toEncrypt: Array<{ path: string; content: string }> = [];
@@ -1766,7 +1769,7 @@ export default class QuildenSyncPlugin extends Plugin {
     );
 
     new Notice("Scanning repo for encrypted files…");
-    const tree = await api.getTree();
+    const { blobs: tree } = await api.getTree();
     const filesToCheck = tree.filter((f) => shouldEncryptPath(f.path, this.settings.encryptionScope));
 
     const toDecrypt: Array<{ path: string; content: string; binary: boolean }> = [];
@@ -1869,7 +1872,7 @@ export default class QuildenSyncPlugin extends Plugin {
     let foundEncrypted = false;
     let passwordCorrect = false;
     try {
-      const tree = await api.getTree();
+      const { blobs: tree } = await api.getTree();
       const mdCandidates = tree
         .filter(f => f.path.endsWith(".md") && !f.path.startsWith("."))
         .slice(0, 8);
@@ -2174,7 +2177,11 @@ export default class QuildenSyncPlugin extends Plugin {
 
     console.log(`[LM] pushChanges: prepared ${filesToPush.length} local file(s) for comparison`);
 
-    const remoteTree = await api.getTree();
+    const { blobs: remoteTree, truncated: remoteTreeTruncated } = await api.getTree();
+    if (remoteTreeTruncated) {
+      console.warn(`[LM] remote tree is truncated (repo too large for single tree fetch). Missing-sync-state files absent from the partial tree will be skipped to avoid re-uploading unchanged content.`);
+    }
+    console.log(`[LM] remote tree: ${remoteTree.length} entries${remoteTreeTruncated ? " (TRUNCATED)" : ""}`);
     const remoteShaByPath = new Map(remoteTree.map((entry) => [entry.path, entry.sha]));
     const changedFilesToPush: Array<{ file: TFile; path: string; content: string; encoding: "utf-8" | "base64" }> = [];
     const unchangedFiles: TFile[] = [];
@@ -2202,7 +2209,16 @@ export default class QuildenSyncPlugin extends Plugin {
       } else {
         const localSha = await computeGitBlobSha(file.content, file.encoding);
         const remoteSha = remoteShaByPath.get(file.path);
-        changed = localSha !== remoteSha;
+        // When the remote tree is truncated, a missing entry may just mean
+        // the file is beyond the truncation cutoff — not that it's absent.
+        // Treat missing-sync-state files absent from a truncated tree as
+        // unchanged (they'll still be compared properly once in syncState).
+        const localDiag = candidateDiagnostics.get(file.path);
+        if (remoteSha === undefined && remoteTreeTruncated && localDiag?.reason === "missing-sync-state") {
+          changed = false; // can't verify — assume unchanged to avoid spurious upload
+        } else {
+          changed = localSha !== remoteSha;
+        }
       }
 
       const localDiagnostic = candidateDiagnostics.get(file.path);
@@ -2298,7 +2314,7 @@ export default class QuildenSyncPlugin extends Plugin {
     const vault = this.app.vault;
 
     // One API call to get all remote SHAs — no content fetched yet
-    const remoteTree = await api.getTree();
+    const { blobs: remoteTree } = await api.getTree();
     console.log(`[LM] pull: ${remoteTree.length} remote entries`);
 
     let created = 0, updated = 0, unchanged = 0;
